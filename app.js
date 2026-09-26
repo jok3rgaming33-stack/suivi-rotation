@@ -248,9 +248,11 @@
   const $importFile = document.getElementById("import-file");
 
   // ——— Render ———
-  function setHeader(title, subtitle, showBack) {
+  function setHeader(title, subtitle, showBack, opts) {
+    opts = opts || {};
     $title.textContent = title;
     $subtitle.textContent = subtitle || "";
+    $subtitle.classList.toggle("brand-slogan", !!opts.brandSlogan);
     $btnBack.classList.toggle("hidden", !showBack);
     document.querySelectorAll(".nav-link[data-view]").forEach((btn) => {
       btn.classList.toggle("active", btn.dataset.view === currentView || (currentView === "detail" && btn.dataset.view === "home"));
@@ -265,7 +267,7 @@
 
   function renderHome() {
     currentView = "home";
-    setHeader("Suivi Rotation", "60 logements · tapotez pour détail", false);
+    setHeader("Suivi Rotation", "Le coup de main qu'il vous faut", false, { brandSlogan: true });
     const g = globalStats();
 
     let unitsHtml = "";
@@ -293,7 +295,7 @@
       }).join("");
 
       unitsHtml += `
-        <button type="button" class="logement-card" data-unit="${id}" aria-label="${id}${name ? " — " + escapeHtml(name) : ""}, ${st.pct}%">
+        <button type="button" class="logement-card neon-corner" data-unit="${id}" aria-label="${id}${name ? " — " + escapeHtml(name) : ""}, ${st.pct}%">
           <div class="card-top">
             <div>
               <span class="card-id">${id}</span>
@@ -311,7 +313,7 @@
     }
 
     $app.innerHTML = `
-      <div class="global-bar">
+      <div class="global-bar neon-corner">
         <div class="label-row">
           <span>Avancement global</span>
           <span class="pct">${g.pct}%</span>
@@ -426,7 +428,7 @@
       });
 
       sections += `
-        <section class="section" id="sec-${corps}">
+        <section class="section neon-panel" id="sec-${corps}">
           <div class="section-header">
             <h2 class="section-title"><span class="dot ${cat.badge}"></span> ${cat.label}</h2>
             <span class="section-pct">${cs.done}/${cs.total} · ${cs.pct}%</span>
@@ -436,7 +438,7 @@
     });
 
     $app.innerHTML = `
-      <div class="detail-meta">
+      <div class="detail-meta neon-corner">
         <div class="label-row" style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:0.5rem;">
           <strong>${currentUnit}</strong>
           <span class="badge ${badgeClassForPct(st.pct)}">${st.pct}%</span>
@@ -517,18 +519,18 @@
 
     $app.innerHTML = `
       <div class="synth-grid">
-        <div class="stat-card full">
+        <div class="stat-card full neon-corner">
           <h3>Avancement total</h3>
           <div class="stat-value">${g.pct}%</div>
           <div class="stat-sub">${g.doneInterv} / ${g.totalInterv} interventions réalisées</div>
           <div class="progress" style="margin-top:0.75rem;"><span style="width:${g.pct}%"></span></div>
         </div>
-        <div class="stat-card done">
+        <div class="stat-card done neon-corner">
           <h3>Logements 100 %</h3>
           <div class="stat-value">${g.unitsComplete}</div>
           <div class="stat-sub">sur 60 logements</div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card neon-corner">
           <h3>En cours / à faire</h3>
           <div class="stat-value">${g.unitsStarted + g.unitsEmpty}</div>
           <div class="stat-sub">${g.unitsStarted} démarrés · ${g.unitsEmpty} non commencés</div>
@@ -537,7 +539,7 @@
           const c = g.byCorps[corps];
           const cat = CATALOGUE[corps];
           return `
-            <div class="stat-card ${cat.badge}">
+            <div class="stat-card neon-corner ${cat.badge}">
               <h3>${cat.label}</h3>
               <div class="stat-value">${c.pct}%</div>
               <div class="stat-sub">${c.done} / ${c.total} · ${CATALOGUE[corps].items.length} points × 60</div>
