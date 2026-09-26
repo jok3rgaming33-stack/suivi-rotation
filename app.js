@@ -1,12 +1,22 @@
 /**
  * Suivi Rotation — interventions locatives (L01–L60)
- * Persistance : localStorage
+ * Persistance : localStorage (métadonnées) + IndexedDB (médias binaires)
  */
 (function () {
   "use strict";
 
   const STORAGE_KEY = "suivi-rotation-v1";
+  const IDB_NAME = "suivi-rotation-media";
+  const IDB_STORE = "blobs";
   const UNIT_COUNT = 60;
+
+  const MEDIA_SECTIONS = ["logement", "plomberie", "chauffage", "sanitaire"];
+  const MAX_MEDIA_PER_SECTION = 8;
+  const MAX_IMAGE_WIDTH = 1280;
+  const JPEG_QUALITY = 0.7;
+  const MAX_VIDEO_BYTES = 20 * 1024 * 1024; // 20 Mo
+  const MAX_CAPTION = 120;
+  const MAX_REPORT = 4000;
 
   const CATALOGUE = {
     plomberie: {
@@ -62,7 +72,7 @@
   };
 
   const CORPS = ["plomberie", "chauffage", "sanitaire"];
-  const TOTAL_ITEMS = CORPS.reduce((n, k) => n + CATALOGUE[k].items.length, 0); // 26
+  const TOTAL_ITEMS = CORPS.reduce((n, k) => n + CATALOGUE[k].items.length, 0);
 
   const STATUS = {
     non: { id: "non", label: "Non" },
@@ -70,12 +80,20 @@
     fait: { id: "fait", label: "Fait" },
   };
 
+  const SECTION_META = {
+    logement: { id: "logement", label: "Logement", badge: "logement", short: "Log." },
+    plomberie: CATALOGUE.plomberie,
+    chauffage: CATALOGUE.chauffage,
+    sanitaire: CATALOGUE.sanitaire,
+  };
+
   // ——— State ———
   let state = null;
-  let currentView = "home"; // home | detail | synthese
-  let currentUnit = null; // "L01" …
-  let filter = "all"; // all | done | partial | empty
+  let currentView = "home";
+  let currentUnit = null;
+  let filter = "all";
   let searchQuery = "";
+  const objectUrlCache = new Map(); // mediaId -> objectURL
 
   // ——— Helpers ———
   function padId(n) {
@@ -86,6 +104,22 @@
     return { status: "non", date: "", note: "" };
   }
 
+  function emptyReports() {
+    const r = {};
+    MEDIA_SECTIONS.forEach((s) => {
+      r[s] = "";
+    });
+    return r;
+  }
+
+  function emptyMedia() {
+    const m = {};
+    MEDIA_SECTIONS.forEach((s) => {
+      m[s] = [];
+    });
+    return m;
+  }
+
   function emptyUnit(id) {
     const interventions = {};
     CORPS.forEach((corps) => {
@@ -93,7 +127,7 @@
         interventions[item.code] = emptyIntervention();
       });
     });
-    return { id, name: "", interventions };
+    return { id, name: "", interventions, reports: emptyReports(), media: emptyMedia() };
   }
 
   function createDefaultState() {
@@ -103,6 +137,138 @@
       units[id] = emptyUnit(id);
     }
     return { version: 1, updatedAt: new Date().toISOString(), units };
+  }
+
+  function uid() {
+    return "m" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  }
+
+  // ——— IndexedDB ———
+  let idbPromise = null;
+
+  function openMediaDB() {
+    if (idbPromise) return idbPromise;
+    idbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) {
+          db.createObjectStore(IDB_STORE, { keyPath: "id" });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    return idbPromise;
+  }
+
+  async function idbPut(id, blob, meta) {
+    const db = await openMediaDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, "readwrite");
+      tx.objectStore(IDB_STORE).put({ id, blob, mime: meta && meta.mime, type: meta && meta.type });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function idbGet(id) {
+    const db = await openMediaDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, "readonly");
+      const req = tx.objectStore(IDB_STORE).get(id);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function idbDelete(id) {
+    const db = await openMediaDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, "readwrite");
+      tx.objectStore(IDB_STORE).delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  function revokeObjectUrl(id) {
+    const url = objectUrlCache.get(id);
+    if (url) {
+      URL.revokeObjectURL(url);
+      objectUrlCache.delete(id);
+    }
+  }
+
+  async function getMediaObjectUrl(id) {
+    if (objectUrlCache.has(id)) return objectUrlCache.get(id);
+    const row = await idbGet(id);
+    if (!row || !row.blob) return null;
+    const url = URL.createObjectURL(row.blob);
+    objectUrlCache.set(id, url);
+    return url;
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function dataUrlToBlob(dataUrl) {
+    const parts = String(dataUrl).split(",");
+    const mimeMatch = parts[0] && parts[0].match(/:(.*?);/);
+    const mime = (mimeMatch && mimeMatch[1]) || "application/octet-stream";
+    const bin = atob(parts[1] || "");
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return new Blob([arr], { type: mime });
+  }
+
+  // ——— Image compress ———
+  function compressImageFile(file) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        try {
+          let w = img.naturalWidth || img.width;
+          let h = img.naturalHeight || img.height;
+          if (w > MAX_IMAGE_WIDTH) {
+            h = Math.round((h * MAX_IMAGE_WIDTH) / w);
+            w = MAX_IMAGE_WIDTH;
+          }
+          const canvas = document.createElement("canvas");
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, w, h);
+          canvas.toBlob(
+            (blob) => {
+              URL.revokeObjectURL(url);
+              if (!blob) {
+                reject(new Error("Compression échouée"));
+                return;
+              }
+              resolve(blob);
+            },
+            "image/jpeg",
+            JPEG_QUALITY
+          );
+        } catch (e) {
+          URL.revokeObjectURL(url);
+          reject(e);
+        }
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error("Image illisible"));
+      };
+      img.src = url;
+    });
   }
 
   function loadState() {
@@ -117,9 +283,27 @@
     }
   }
 
+  function normalizeMediaItem(item) {
+    if (!item || typeof item !== "object") return null;
+    const id = typeof item.id === "string" ? item.id : uid();
+    const type = item.type === "video" ? "video" : "image";
+    return {
+      id,
+      type,
+      mime: typeof item.mime === "string" ? item.mime : type === "video" ? "video/mp4" : "image/jpeg",
+      caption: typeof item.caption === "string" ? item.caption.slice(0, MAX_CAPTION) : "",
+      createdAt: typeof item.createdAt === "string" ? item.createdAt : new Date().toISOString(),
+      size: typeof item.size === "number" ? item.size : 0,
+      // dataUrl only during import migration — stripped before save
+      _dataUrl: typeof item.dataUrl === "string" ? item.dataUrl : null,
+    };
+  }
+
   function migrateState(data) {
     const base = createDefaultState();
     if (!data || !data.units) return base;
+    const pendingBlobs = [];
+
     for (let i = 1; i <= UNIT_COUNT; i++) {
       const id = padId(i);
       const src = data.units[id];
@@ -138,8 +322,48 @@
           };
         });
       });
+
+      // reports
+      const reportsSrc = src.reports || {};
+      MEDIA_SECTIONS.forEach((sec) => {
+        if (typeof reportsSrc[sec] === "string") {
+          base.units[id].reports[sec] = reportsSrc[sec].slice(0, MAX_REPORT);
+        }
+      });
+
+      // media: prefer src.media, fall back to src.photos (legacy dataUrl)
+      const mediaSrc = src.media || src.photos || {};
+      MEDIA_SECTIONS.forEach((sec) => {
+        const list = Array.isArray(mediaSrc[sec]) ? mediaSrc[sec] : [];
+        base.units[id].media[sec] = list
+          .slice(0, MAX_MEDIA_PER_SECTION)
+          .map(normalizeMediaItem)
+          .filter(Boolean)
+          .map((m) => {
+            if (m._dataUrl) {
+              pendingBlobs.push({ id: m.id, dataUrl: m._dataUrl, mime: m.mime, type: m.type });
+            }
+            const { _dataUrl, ...clean } = m;
+            return clean;
+          });
+      });
     }
     base.updatedAt = data.updatedAt || base.updatedAt;
+
+    // hydrate IndexedDB from embedded dataUrls (import / legacy)
+    if (pendingBlobs.length) {
+      Promise.all(
+        pendingBlobs.map(async (p) => {
+          try {
+            const blob = dataUrlToBlob(p.dataUrl);
+            await idbPut(p.id, blob, { mime: p.mime, type: p.type });
+          } catch (e) {
+            console.warn("Import média échoué", p.id, e);
+          }
+        })
+      ).catch(() => {});
+    }
+
     return base;
   }
 
@@ -148,8 +372,12 @@
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     } catch (e) {
-      toast("Erreur sauvegarde localStorage");
+      const msg = e && (e.name === "QuotaExceededError" || e.code === 22)
+        ? "Quota localStorage dépassé — médiatheque trop lourde"
+        : "Erreur sauvegarde localStorage";
+      toast(msg);
       console.error(e);
+      throw e;
     }
   }
 
@@ -235,7 +463,13 @@
     toast._t = setTimeout(() => {
       el.classList.add("hidden");
       el.classList.remove("show");
-    }, 2400);
+    }, 2800);
+  }
+
+  function formatBytes(n) {
+    if (!n || n < 1024) return (n || 0) + " o";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(0) + " Ko";
+    return (n / (1024 * 1024)).toFixed(1) + " Mo";
   }
 
   // ——— DOM refs ———
@@ -376,12 +610,59 @@
     window.scrollTo(0, 0);
   }
 
+  function renderDocBlock(unit, sectionKey) {
+    const meta = SECTION_META[sectionKey];
+    const report = (unit.reports && unit.reports[sectionKey]) || "";
+    const media = (unit.media && unit.media[sectionKey]) || [];
+    const count = media.length;
+    const full = count >= MAX_MEDIA_PER_SECTION;
+
+    const thumbs = media
+      .map((m) => {
+        const isVideo = m.type === "video";
+        return `
+          <div class="media-thumb" data-media-id="${escapeHtml(m.id)}" data-section="${sectionKey}">
+            <button type="button" class="media-preview" data-action="open" data-media-id="${escapeHtml(m.id)}" data-section="${sectionKey}" aria-label="Agrandir">
+              <span class="media-placeholder ${isVideo ? "is-video" : "is-image"}" data-load-id="${escapeHtml(m.id)}">
+                ${isVideo ? '<span class="media-play">▶</span>' : '<span class="media-cam">🖼</span>'}
+              </span>
+              ${isVideo ? '<span class="media-badge-type">Vidéo</span>' : ""}
+            </button>
+            <input type="text" class="media-caption" data-media-id="${escapeHtml(m.id)}" data-section="${sectionKey}" value="${escapeHtml(m.caption || "")}" placeholder="Légende…" maxlength="${MAX_CAPTION}" />
+            <button type="button" class="media-delete" data-action="delete" data-media-id="${escapeHtml(m.id)}" data-section="${sectionKey}" aria-label="Supprimer">×</button>
+          </div>`;
+      })
+      .join("");
+
+    return `
+      <div class="doc-block" data-doc-section="${sectionKey}">
+        <div class="doc-header">
+          <h3 class="doc-title"><span class="dot ${meta.badge}"></span> Documentation — ${escapeHtml(meta.label)}</h3>
+          <span class="doc-count">${count}/${MAX_MEDIA_PER_SECTION}</span>
+        </div>
+        <div class="field report-field">
+          <label for="report-${sectionKey}">Rapport écrit / constat</label>
+          <textarea id="report-${sectionKey}" data-report-section="${sectionKey}" rows="3" maxlength="${MAX_REPORT}" placeholder="Notes de constat, dysfonctionnements, observations…">${escapeHtml(report)}</textarea>
+        </div>
+        <div class="media-toolbar">
+          <button type="button" class="btn btn-primary btn-add-media" data-add-section="${sectionKey}" ${full ? "disabled" : ""}>
+            ${full ? "Galerie pleine" : "Ajouter photo / vidéo"}
+          </button>
+          <input type="file" class="hidden media-file-input" data-section="${sectionKey}" accept="image/*,video/*" capture="environment" />
+        </div>
+        <div class="media-grid">${thumbs || '<p class="media-empty">Aucune photo ni vidéo pour cette partie.</p>'}</div>
+      </div>`;
+  }
+
   function renderDetail() {
     const unit = state.units[currentUnit];
     if (!unit) {
       renderHome();
       return;
     }
+    if (!unit.reports) unit.reports = emptyReports();
+    if (!unit.media) unit.media = emptyMedia();
+
     const st = unitStats(unit);
     const name = (unit.name || "").trim();
     setHeader(
@@ -391,6 +672,15 @@
     );
 
     let sections = "";
+    // Logement-level documentation first
+    sections += `
+      <section class="section neon-panel section-logement" id="sec-logement">
+        <div class="section-header">
+          <h2 class="section-title"><span class="dot logement"></span> Logement (général)</h2>
+        </div>
+        ${renderDocBlock(unit, "logement")}
+      </section>`;
+
     CORPS.forEach((corps) => {
       const cat = CATALOGUE[corps];
       const cs = st.byCorps[corps];
@@ -434,6 +724,7 @@
             <span class="section-pct">${cs.done}/${cs.total} · ${cs.pct}%</span>
           </div>
           ${items}
+          ${renderDocBlock(unit, corps)}
         </section>`;
     });
 
@@ -459,6 +750,11 @@
       ${sections}
     `;
 
+    bindDetailEvents(unit);
+    hydrateMediaThumbs(unit);
+  }
+
+  function bindDetailEvents(unit) {
     $app.querySelectorAll(".status-btn").forEach((btn) => {
       btn.addEventListener("click", () => {
         const code = btn.dataset.code;
@@ -492,6 +788,212 @@
     document.getElementById("unit-name").addEventListener("keydown", (e) => {
       if (e.key === "Enter") saveUnitName();
     });
+
+    $app.querySelectorAll("[data-report-section]").forEach((ta) => {
+      const saveReport = () => {
+        const sec = ta.dataset.reportSection;
+        unit.reports[sec] = ta.value.slice(0, MAX_REPORT);
+        try {
+          saveState();
+        } catch (_) {}
+      };
+      ta.addEventListener("change", saveReport);
+      ta.addEventListener("blur", saveReport);
+    });
+
+    $app.querySelectorAll("[data-add-section]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const sec = btn.dataset.addSection;
+        const input = $app.querySelector(`.media-file-input[data-section="${sec}"]`);
+        if (input) input.click();
+      });
+    });
+
+    $app.querySelectorAll(".media-file-input").forEach((input) => {
+      input.addEventListener("change", async () => {
+        const file = input.files && input.files[0];
+        const sec = input.dataset.section;
+        input.value = "";
+        if (file) await addMediaFile(unit, sec, file);
+      });
+    });
+
+    $app.querySelectorAll(".media-caption").forEach((input) => {
+      const saveCap = () => {
+        const mid = input.dataset.mediaId;
+        const sec = input.dataset.section;
+        const list = unit.media[sec] || [];
+        const item = list.find((m) => m.id === mid);
+        if (item) {
+          item.caption = input.value.slice(0, MAX_CAPTION);
+          try {
+            saveState();
+          } catch (_) {}
+        }
+      };
+      input.addEventListener("change", saveCap);
+      input.addEventListener("blur", saveCap);
+    });
+
+    $app.querySelectorAll('[data-action="delete"]').forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const mid = btn.dataset.mediaId;
+        const sec = btn.dataset.section;
+        const ok = window.confirm("Supprimer ce média ?");
+        if (!ok) return;
+        await deleteMedia(unit, sec, mid);
+      });
+    });
+
+    $app.querySelectorAll('[data-action="open"]').forEach((btn) => {
+      btn.addEventListener("click", () => {
+        openLightbox(unit, btn.dataset.section, btn.dataset.mediaId);
+      });
+    });
+  }
+
+  async function hydrateMediaThumbs(unit) {
+    const ids = [];
+    MEDIA_SECTIONS.forEach((sec) => {
+      (unit.media[sec] || []).forEach((m) => ids.push(m));
+    });
+    for (const m of ids) {
+      const el = $app.querySelector(`[data-load-id="${m.id}"]`);
+      if (!el) continue;
+      try {
+        const url = await getMediaObjectUrl(m.id);
+        if (!url) continue;
+        if (m.type === "video") {
+          el.innerHTML = `<video src="${url}" muted playsinline preload="metadata"></video><span class="media-play">▶</span>`;
+        } else {
+          el.innerHTML = `<img src="${url}" alt="" loading="lazy" />`;
+        }
+        el.classList.add("loaded");
+      } catch (_) {}
+    }
+  }
+
+  async function addMediaFile(unit, section, file) {
+    if (!unit.media[section]) unit.media[section] = [];
+    if (unit.media[section].length >= MAX_MEDIA_PER_SECTION) {
+      toast("Galerie pleine (max " + MAX_MEDIA_PER_SECTION + " médias)");
+      return;
+    }
+
+    const isVideo = (file.type || "").startsWith("video/");
+    const isImage = (file.type || "").startsWith("image/") || (!file.type && /\.(jpe?g|png|gif|webp|heic)$/i.test(file.name || ""));
+
+    if (!isVideo && !isImage) {
+      toast("Format non supporté (photo ou vidéo)");
+      return;
+    }
+
+    toast(isVideo ? "Enregistrement vidéo…" : "Compression photo…");
+
+    try {
+      let blob;
+      let mime;
+      let type;
+
+      if (isVideo) {
+        if (file.size > MAX_VIDEO_BYTES) {
+          toast("Vidéo trop lourde (max " + formatBytes(MAX_VIDEO_BYTES) + ")");
+          return;
+        }
+        blob = file;
+        mime = file.type || "video/mp4";
+        type = "video";
+      } else {
+        blob = await compressImageFile(file);
+        mime = "image/jpeg";
+        type = "image";
+      }
+
+      const id = uid();
+      await idbPut(id, blob, { mime, type });
+
+      unit.media[section].push({
+        id,
+        type,
+        mime,
+        caption: "",
+        createdAt: new Date().toISOString(),
+        size: blob.size,
+      });
+
+      try {
+        saveState();
+      } catch (_) {
+        // rollback
+        unit.media[section] = unit.media[section].filter((m) => m.id !== id);
+        await idbDelete(id);
+        return;
+      }
+
+      toast(type === "video" ? "Vidéo ajoutée" : "Photo ajoutée");
+      renderDetail();
+    } catch (e) {
+      console.error(e);
+      toast(e && e.message ? e.message : "Échec ajout média");
+    }
+  }
+
+  async function deleteMedia(unit, section, mediaId) {
+    unit.media[section] = (unit.media[section] || []).filter((m) => m.id !== mediaId);
+    revokeObjectUrl(mediaId);
+    try {
+      await idbDelete(mediaId);
+    } catch (_) {}
+    try {
+      saveState();
+    } catch (_) {}
+    toast("Média supprimé");
+    renderDetail();
+  }
+
+  async function openLightbox(unit, section, mediaId) {
+    const item = (unit.media[section] || []).find((m) => m.id === mediaId);
+    if (!item) return;
+    const url = await getMediaObjectUrl(mediaId);
+    if (!url) {
+      toast("Média introuvable");
+      return;
+    }
+
+    closeLightbox();
+    const overlay = document.createElement("div");
+    overlay.id = "lightbox";
+    overlay.className = "lightbox";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    const body =
+      item.type === "video"
+        ? `<video src="${url}" controls playsinline autoplay class="lightbox-media"></video>`
+        : `<img src="${url}" alt="${escapeHtml(item.caption || "")}" class="lightbox-media" />`;
+    overlay.innerHTML = `
+      <div class="lightbox-inner">
+        <button type="button" class="lightbox-close" aria-label="Fermer">×</button>
+        ${body}
+        ${item.caption ? `<p class="lightbox-caption">${escapeHtml(item.caption)}</p>` : ""}
+        <p class="lightbox-meta">${item.type === "video" ? "Vidéo" : "Photo"} · ${formatBytes(item.size)}</p>
+      </div>`;
+    document.body.appendChild(overlay);
+    const close = () => closeLightbox();
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay || e.target.classList.contains("lightbox-close")) close();
+    });
+    document.addEventListener("keydown", lightboxKeyHandler);
+  }
+
+  function lightboxKeyHandler(e) {
+    if (e.key === "Escape") closeLightbox();
+  }
+
+  function closeLightbox() {
+    const el = document.getElementById("lightbox");
+    if (el) el.remove();
+    document.removeEventListener("keydown", lightboxKeyHandler);
   }
 
   function saveUnitName() {
@@ -547,7 +1049,7 @@
             </div>`;
         }).join("")}
       </div>
-      <p class="legend">Données stockées localement sur cet appareil (localStorage). Pensez à exporter régulièrement.</p>
+      <p class="legend">Données stockées localement sur cet appareil (localStorage + IndexedDB pour photos/vidéos). Pensez à exporter régulièrement.</p>
       <div class="toolbar" style="margin-top:1rem;">
         <button type="button" class="btn btn-primary" id="btn-go-home">Voir les logements</button>
       </div>
@@ -560,19 +1062,48 @@
   }
 
   // ——— Import / Export / Reset ———
-  function exportJSON() {
+  async function buildExportPayload() {
+    const clone = JSON.parse(JSON.stringify(state));
+    for (let i = 1; i <= UNIT_COUNT; i++) {
+      const id = padId(i);
+      const unit = clone.units[id];
+      if (!unit || !unit.media) continue;
+      for (const sec of MEDIA_SECTIONS) {
+        const list = unit.media[sec] || [];
+        for (let j = 0; j < list.length; j++) {
+          const m = list[j];
+          try {
+            const row = await idbGet(m.id);
+            if (row && row.blob) {
+              m.dataUrl = await blobToDataUrl(row.blob);
+            }
+          } catch (_) {}
+        }
+      }
+    }
+    return clone;
+  }
+
+  async function exportJSON() {
     closeMenu();
-    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    const stamp = todayISO();
-    a.href = url;
-    a.download = `suivi-rotation-${stamp}.json`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-    toast("Export téléchargé");
+    toast("Préparation export (médias)…");
+    try {
+      const payload = await buildExportPayload();
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const stamp = todayISO();
+      a.href = url;
+      a.download = `suivi-rotation-${stamp}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast("Export téléchargé");
+    } catch (e) {
+      console.error(e);
+      toast("Échec export");
+    }
   }
 
   function importJSON(file) {
@@ -595,19 +1126,35 @@
     reader.readAsText(file);
   }
 
+  async function clearAllMediaBlobs() {
+    try {
+      const db = await openMediaDB();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, "readwrite");
+        tx.objectStore(IDB_STORE).clear();
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch (_) {}
+    objectUrlCache.forEach((url) => URL.revokeObjectURL(url));
+    objectUrlCache.clear();
+  }
+
   function resetAll() {
     closeMenu();
     const ok = window.confirm(
-      "Réinitialiser toutes les données ?\n\nLes 60 logements et les 26 interventions reviendront à zéro. Cette action est irréversible (sauf si vous avez un export JSON)."
+      "Réinitialiser toutes les données ?\n\nLes 60 logements, interventions, rapports et médias reviendront à zéro. Cette action est irréversible (sauf si vous avez un export JSON)."
     );
     if (!ok) return;
-    state = createDefaultState();
-    saveState();
-    searchQuery = "";
-    filter = "all";
-    currentUnit = null;
-    toast("Données réinitialisées");
-    renderHome();
+    clearAllMediaBlobs().then(() => {
+      state = createDefaultState();
+      saveState();
+      searchQuery = "";
+      filter = "all";
+      currentUnit = null;
+      toast("Données réinitialisées");
+      renderHome();
+    });
   }
 
   function closeMenu() {
@@ -623,6 +1170,7 @@
 
   // ——— Events ———
   $btnBack.addEventListener("click", () => {
+    closeLightbox();
     currentUnit = null;
     currentView = "home";
     renderHome();
@@ -633,6 +1181,7 @@
   document.querySelectorAll(".nav-link[data-view]").forEach((btn) => {
     btn.addEventListener("click", () => {
       closeMenu();
+      closeLightbox();
       const view = btn.dataset.view;
       if (view === "home") {
         currentUnit = null;
@@ -643,7 +1192,9 @@
     });
   });
 
-  document.getElementById("btn-export").addEventListener("click", exportJSON);
+  document.getElementById("btn-export").addEventListener("click", () => {
+    exportJSON();
+  });
   document.getElementById("btn-import").addEventListener("click", () => {
     closeMenu();
     $importFile.click();
@@ -658,5 +1209,6 @@
 
   // ——— Boot ———
   state = loadState();
+  openMediaDB().catch(() => {});
   renderHome();
 })();
