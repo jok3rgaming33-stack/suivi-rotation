@@ -87,12 +87,30 @@
     sanitaire: CATALOGUE.sanitaire,
   };
 
+  const COMPTA_CATEGORIES = [
+    { id: "pieces", label: "Pièces" },
+    { id: "main_oeuvre", label: "Main d'œuvre" },
+    { id: "deplacement", label: "Déplacement" },
+    { id: "sous_traitance", label: "Sous-traitance" },
+    { id: "facturation", label: "Facturation" },
+    { id: "acompte", label: "Acompte" },
+    { id: "autre", label: "Autre" },
+  ];
+
+  const COMPTA_CAT_MAP = Object.fromEntries(COMPTA_CATEGORIES.map((c) => [c.id, c.label]));
+
   // ——— State ———
   let state = null;
   let currentView = "home";
   let currentUnit = null;
   let filter = "all";
   let searchQuery = "";
+  let comptaPeriod = "month"; // month | all | custom
+  let comptaType = "all"; // all | recette | depense
+  let comptaUnit = ""; // "" | L01…
+  let comptaCustomFrom = "";
+  let comptaCustomTo = "";
+  let comptaEditingId = null; // null = list, string = edit form, "new" = create form
   const objectUrlCache = new Map(); // mediaId -> objectURL
 
   // ——— Helpers ———
@@ -136,7 +154,12 @@
       const id = padId(i);
       units[id] = emptyUnit(id);
     }
-    return { version: 1, updatedAt: new Date().toISOString(), units };
+    return {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      units,
+      compta: { entries: [] },
+    };
   }
 
   function uid() {
@@ -299,6 +322,45 @@
     };
   }
 
+  function normalizeComptaEntry(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const type = raw.type === "recette" ? "recette" : raw.type === "depense" ? "depense" : null;
+    if (!type) return null;
+    let amount = typeof raw.amount === "number" ? raw.amount : parseFloat(raw.amount);
+    if (!Number.isFinite(amount) || amount < 0) return null;
+    amount = Math.round(amount * 100) / 100;
+    const category = COMPTA_CAT_MAP[raw.category] ? raw.category : "autre";
+    const label = typeof raw.label === "string" ? raw.label.trim().slice(0, 120) : "";
+    if (!label) return null;
+    let unitId = typeof raw.unitId === "string" ? raw.unitId.trim() : "";
+    if (unitId && !/^L\d{2}$/.test(unitId)) unitId = "";
+    const date = typeof raw.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(raw.date)
+      ? raw.date
+      : todayISOSafe();
+    return {
+      id: typeof raw.id === "string" && raw.id ? raw.id : uid(),
+      type,
+      amount,
+      label,
+      category,
+      date,
+      unitId,
+      note: typeof raw.note === "string" ? raw.note.trim().slice(0, 500) : "",
+      createdAt: typeof raw.createdAt === "string" ? raw.createdAt : new Date().toISOString(),
+    };
+  }
+
+  function todayISOSafe() {
+    const d = new Date();
+    return (
+      d.getFullYear() +
+      "-" +
+      String(d.getMonth() + 1).padStart(2, "0") +
+      "-" +
+      String(d.getDate()).padStart(2, "0")
+    );
+  }
+
   function migrateState(data) {
     const base = createDefaultState();
     if (!data || !data.units) return base;
@@ -349,6 +411,15 @@
       });
     }
     base.updatedAt = data.updatedAt || base.updatedAt;
+
+    // compta
+    base.compta = { entries: [] };
+    const comptaSrc = (data.compta && Array.isArray(data.compta.entries))
+      ? data.compta.entries
+      : (Array.isArray(data.compta) ? data.compta : []);
+    base.compta.entries = comptaSrc
+      .map(normalizeComptaEntry)
+      .filter(Boolean);
 
     // hydrate IndexedDB from embedded dataUrls (import / legacy)
     if (pendingBlobs.length) {
@@ -1013,6 +1084,435 @@
     return `${y}-${m}-${day}`;
   }
 
+  // ——— Comptabilité ———
+  function formatMoney(n) {
+    const v = Number(n) || 0;
+    return v.toLocaleString("fr-FR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " €";
+  }
+
+  function formatDateFR(iso) {
+    if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return "—";
+    const [y, m, d] = iso.split("-");
+    return d + "/" + m + "/" + y;
+  }
+
+  function monthBounds(ref) {
+    const d = ref ? new Date(ref) : new Date();
+    const y = d.getFullYear();
+    const m = d.getMonth();
+    const from = y + "-" + String(m + 1).padStart(2, "0") + "-01";
+    const last = new Date(y, m + 1, 0).getDate();
+    const to = y + "-" + String(m + 1).padStart(2, "0") + "-" + String(last).padStart(2, "0");
+    return { from, to };
+  }
+
+  function ensureCompta() {
+    if (!state.compta || !Array.isArray(state.compta.entries)) {
+      state.compta = { entries: [] };
+    }
+  }
+
+  function filteredComptaEntries() {
+    ensureCompta();
+    let from = "";
+    let to = "";
+    if (comptaPeriod === "month") {
+      const b = monthBounds();
+      from = b.from;
+      to = b.to;
+    } else if (comptaPeriod === "custom") {
+      from = comptaCustomFrom || "";
+      to = comptaCustomTo || "";
+    }
+    return state.compta.entries
+      .filter((e) => {
+        if (comptaType !== "all" && e.type !== comptaType) return false;
+        if (comptaUnit && e.unitId !== comptaUnit) return false;
+        if (from && e.date < from) return false;
+        if (to && e.date > to) return false;
+        return true;
+      })
+      .slice()
+      .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : a.createdAt < b.createdAt ? 1 : -1));
+  }
+
+  function comptaTotals(entries) {
+    let recettes = 0;
+    let depenses = 0;
+    entries.forEach((e) => {
+      if (e.type === "recette") recettes += e.amount;
+      else depenses += e.amount;
+    });
+    return {
+      recettes: Math.round(recettes * 100) / 100,
+      depenses: Math.round(depenses * 100) / 100,
+      solde: Math.round((recettes - depenses) * 100) / 100,
+    };
+  }
+
+  function unitOptionsHtml(selected) {
+    let opts = '<option value="">— Aucun —</option>';
+    for (let i = 1; i <= UNIT_COUNT; i++) {
+      const id = padId(i);
+      const name = (state.units[id] && state.units[id].name) || "";
+      const label = name ? id + " — " + name : id;
+      opts +=
+        '<option value="' +
+        id +
+        '"' +
+        (selected === id ? " selected" : "") +
+        ">" +
+        escapeHtml(label) +
+        "</option>";
+    }
+    return opts;
+  }
+
+  function categoryOptionsHtml(selected) {
+    return COMPTA_CATEGORIES.map((c) => {
+      return (
+        '<option value="' +
+        c.id +
+        '"' +
+        (selected === c.id ? " selected" : "") +
+        ">" +
+        escapeHtml(c.label) +
+        "</option>"
+      );
+    }).join("");
+  }
+
+  function renderComptaForm(entry) {
+    const isNew = !entry;
+    const e = entry || {
+      type: "depense",
+      amount: "",
+      label: "",
+      category: "pieces",
+      date: todayISO(),
+      unitId: "",
+      note: "",
+    };
+    return `
+      <div class="compta-form-card neon-corner">
+        <h3 class="compta-form-title">${isNew ? "Nouvelle ligne" : "Modifier la ligne"}</h3>
+        <div class="field">
+          <label>Type</label>
+          <div class="status-group compta-type-group" role="group" aria-label="Type">
+            <button type="button" class="status-btn ${e.type === "recette" ? "active" : ""}" data-ctype="recette">Recette</button>
+            <button type="button" class="status-btn ${e.type === "depense" ? "active" : ""}" data-ctype="depense">Dépense</button>
+          </div>
+        </div>
+        <div class="field">
+          <label for="compta-amount">Montant (€)</label>
+          <input type="number" id="compta-amount" inputmode="decimal" step="0.01" min="0" placeholder="0,00" value="${e.amount !== "" ? escapeHtml(String(e.amount)) : ""}" />
+        </div>
+        <div class="field">
+          <label for="compta-label">Libellé</label>
+          <input type="text" id="compta-label" maxlength="120" placeholder="Ex. : mitigeur cuisine L12" value="${escapeHtml(e.label)}" />
+        </div>
+        <div class="field">
+          <label for="compta-category">Catégorie</label>
+          <select id="compta-category">${categoryOptionsHtml(e.category)}</select>
+        </div>
+        <div class="field">
+          <label for="compta-date">Date</label>
+          <input type="date" id="compta-date" value="${escapeHtml(e.date || todayISO())}" />
+        </div>
+        <div class="field">
+          <label for="compta-unit">Logement (optionnel)</label>
+          <select id="compta-unit">${unitOptionsHtml(e.unitId || "")}</select>
+        </div>
+        <div class="field">
+          <label for="compta-note">Note</label>
+          <textarea id="compta-note" rows="2" maxlength="500" placeholder="Optionnel…">${escapeHtml(e.note || "")}</textarea>
+        </div>
+        <div class="form-actions">
+          <button type="button" class="btn btn-ghost" id="compta-cancel">Annuler</button>
+          <button type="button" class="btn btn-primary" id="compta-save">Enregistrer</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function bindComptaForm(existingId) {
+    let selectedType = "depense";
+    if (existingId) {
+      const found = state.compta.entries.find((x) => x.id === existingId);
+      if (found) selectedType = found.type;
+    }
+    const typeGroup = $app.querySelector(".compta-type-group");
+    if (typeGroup) {
+      typeGroup.querySelectorAll("[data-ctype]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          selectedType = btn.dataset.ctype;
+          typeGroup.querySelectorAll("[data-ctype]").forEach((b) => {
+            b.classList.toggle("active", b.dataset.ctype === selectedType);
+          });
+        });
+      });
+    }
+
+    document.getElementById("compta-cancel").addEventListener("click", () => {
+      comptaEditingId = null;
+      renderCompta();
+    });
+
+    document.getElementById("compta-save").addEventListener("click", () => {
+      const amountRaw = document.getElementById("compta-amount").value;
+      const amount = parseFloat(String(amountRaw).replace(",", "."));
+      const label = document.getElementById("compta-label").value.trim();
+      const category = document.getElementById("compta-category").value;
+      const date = document.getElementById("compta-date").value;
+      const unitId = document.getElementById("compta-unit").value;
+      const note = document.getElementById("compta-note").value.trim();
+
+      if (!label) {
+        toast("Libellé obligatoire");
+        return;
+      }
+      if (!Number.isFinite(amount) || amount < 0) {
+        toast("Montant invalide");
+        return;
+      }
+      if (!date) {
+        toast("Date obligatoire");
+        return;
+      }
+
+      ensureCompta();
+      const payload = {
+        id: existingId || uid(),
+        type: selectedType,
+        amount: Math.round(amount * 100) / 100,
+        label: label.slice(0, 120),
+        category: COMPTA_CAT_MAP[category] ? category : "autre",
+        date,
+        unitId: unitId || "",
+        note: note.slice(0, 500),
+        createdAt: new Date().toISOString(),
+      };
+
+      if (existingId) {
+        const idx = state.compta.entries.findIndex((x) => x.id === existingId);
+        if (idx >= 0) {
+          payload.createdAt = state.compta.entries[idx].createdAt || payload.createdAt;
+          state.compta.entries[idx] = payload;
+        } else {
+          state.compta.entries.push(payload);
+        }
+        toast("Ligne modifiée");
+      } else {
+        state.compta.entries.push(payload);
+        toast("Ligne ajoutée");
+      }
+      saveState();
+      comptaEditingId = null;
+      renderCompta();
+    });
+  }
+
+  function renderCompta() {
+    currentView = "compta";
+    currentUnit = null;
+    setHeader("Comptabilité", "Recettes & dépenses", false);
+    ensureCompta();
+
+    if (comptaEditingId === "new") {
+      $app.innerHTML = renderComptaForm(null);
+      bindComptaForm(null);
+      return;
+    }
+    if (comptaEditingId && comptaEditingId !== "new") {
+      const entry = state.compta.entries.find((x) => x.id === comptaEditingId);
+      if (!entry) {
+        comptaEditingId = null;
+      } else {
+        $app.innerHTML = renderComptaForm(entry);
+        bindComptaForm(entry.id);
+        return;
+      }
+    }
+
+    const entries = filteredComptaEntries();
+    const totals = comptaTotals(entries);
+    const soldeClass = totals.solde > 0 ? "positive" : totals.solde < 0 ? "negative" : "neutral";
+
+    const periodLabel =
+      comptaPeriod === "month"
+        ? "Ce mois"
+        : comptaPeriod === "all"
+          ? "Tout"
+          : "Période";
+
+    let listHtml = "";
+    if (!entries.length) {
+      listHtml = `<div class="empty-state">Aucune ligne pour ce filtre.<br/>Appuyez sur <strong>Ajouter</strong> pour enregistrer une recette ou une dépense.</div>`;
+    } else {
+      listHtml = entries
+        .map((e) => {
+          const sign = e.type === "recette" ? "+" : "−";
+          const amtClass = e.type === "recette" ? "recette" : "depense";
+          const catLabel = COMPTA_CAT_MAP[e.category] || e.category;
+          const unitBadge = e.unitId
+            ? `<span class="badge logement">${escapeHtml(e.unitId)}</span>`
+            : "";
+          const noteHtml = e.note
+            ? `<p class="compta-note">${escapeHtml(e.note)}</p>`
+            : "";
+          return `
+            <article class="compta-card neon-corner ${amtClass}" data-id="${escapeHtml(e.id)}">
+              <div class="card-top">
+                <div>
+                  <span class="compta-date">${formatDateFR(e.date)}</span>
+                  <p class="compta-label">${escapeHtml(e.label)}</p>
+                </div>
+                <span class="compta-amount ${amtClass}">${sign}${formatMoney(e.amount)}</span>
+              </div>
+              <div class="card-badges">
+                <span class="badge">${escapeHtml(catLabel)}</span>
+                <span class="badge ${e.type === "recette" ? "done" : ""}">${e.type === "recette" ? "Recette" : "Dépense"}</span>
+                ${unitBadge}
+              </div>
+              ${noteHtml}
+              <div class="compta-actions">
+                <button type="button" class="btn btn-ghost btn-sm" data-edit="${escapeHtml(e.id)}">Modifier</button>
+                <button type="button" class="btn btn-danger-ghost btn-sm" data-del="${escapeHtml(e.id)}">Supprimer</button>
+              </div>
+            </article>`;
+        })
+        .join("");
+    }
+
+    const customRow =
+      comptaPeriod === "custom"
+        ? `
+      <div class="compta-custom-dates">
+        <div class="field">
+          <label for="compta-from">Du</label>
+          <input type="date" id="compta-from" value="${escapeHtml(comptaCustomFrom)}" />
+        </div>
+        <div class="field">
+          <label for="compta-to">Au</label>
+          <input type="date" id="compta-to" value="${escapeHtml(comptaCustomTo)}" />
+        </div>
+      </div>`
+        : "";
+
+    $app.innerHTML = `
+      <div class="compta-summary">
+        <div class="stat-card neon-corner compta-recettes">
+          <h3>Total recettes</h3>
+          <div class="stat-value">${formatMoney(totals.recettes)}</div>
+          <div class="stat-sub">${periodLabel}</div>
+        </div>
+        <div class="stat-card neon-corner compta-depenses">
+          <h3>Total dépenses</h3>
+          <div class="stat-value">${formatMoney(totals.depenses)}</div>
+          <div class="stat-sub">${periodLabel}</div>
+        </div>
+        <div class="stat-card neon-corner full compta-solde ${soldeClass}">
+          <h3>Solde</h3>
+          <div class="stat-value">${formatMoney(totals.solde)}</div>
+          <div class="stat-sub">${entries.length} ligne${entries.length !== 1 ? "s" : ""}</div>
+        </div>
+      </div>
+
+      <div class="toolbar compta-toolbar">
+        <div class="filter-chips" role="group" aria-label="Période">
+          <button type="button" class="chip ${comptaPeriod === "month" ? "active" : ""}" data-cperiod="month">Ce mois</button>
+          <button type="button" class="chip ${comptaPeriod === "all" ? "active" : ""}" data-cperiod="all">Tout</button>
+          <button type="button" class="chip ${comptaPeriod === "custom" ? "active" : ""}" data-cperiod="custom">Période</button>
+        </div>
+        <div class="filter-chips" role="group" aria-label="Type">
+          <button type="button" class="chip ${comptaType === "all" ? "active" : ""}" data-ctype-filter="all">Tous</button>
+          <button type="button" class="chip ${comptaType === "recette" ? "active" : ""}" data-ctype-filter="recette">Recettes</button>
+          <button type="button" class="chip ${comptaType === "depense" ? "active" : ""}" data-ctype-filter="depense">Dépenses</button>
+        </div>
+        <div class="field compta-unit-filter">
+          <label for="compta-filter-unit" class="sr-only">Logement</label>
+          <select id="compta-filter-unit">
+            <option value="">Tous les logements</option>
+            ${Array.from({ length: UNIT_COUNT }, (_, i) => {
+              const id = padId(i + 1);
+              return `<option value="${id}"${comptaUnit === id ? " selected" : ""}>${id}</option>`;
+            }).join("")}
+          </select>
+        </div>
+      </div>
+      ${customRow}
+
+      <div class="compta-list">${listHtml}</div>
+
+      <button type="button" class="fab-compta" id="compta-add" aria-label="Ajouter une ligne">
+        <span class="fab-plus">+</span>
+        <span class="fab-label">Ajouter</span>
+      </button>
+    `;
+
+    document.getElementById("compta-add").addEventListener("click", () => {
+      comptaEditingId = "new";
+      renderCompta();
+    });
+
+    $app.querySelectorAll("[data-cperiod]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        comptaPeriod = btn.dataset.cperiod;
+        renderCompta();
+      });
+    });
+
+    $app.querySelectorAll("[data-ctype-filter]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        comptaType = btn.dataset.ctypeFilter;
+        renderCompta();
+      });
+    });
+
+    const unitFilter = document.getElementById("compta-filter-unit");
+    if (unitFilter) {
+      unitFilter.addEventListener("change", () => {
+        comptaUnit = unitFilter.value;
+        renderCompta();
+      });
+    }
+
+    const fromEl = document.getElementById("compta-from");
+    const toEl = document.getElementById("compta-to");
+    if (fromEl) {
+      fromEl.addEventListener("change", () => {
+        comptaCustomFrom = fromEl.value;
+        renderCompta();
+      });
+    }
+    if (toEl) {
+      toEl.addEventListener("change", () => {
+        comptaCustomTo = toEl.value;
+        renderCompta();
+      });
+    }
+
+    $app.querySelectorAll("[data-edit]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        comptaEditingId = btn.dataset.edit;
+        renderCompta();
+      });
+    });
+
+    $app.querySelectorAll("[data-del]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const id = btn.dataset.del;
+        const entry = state.compta.entries.find((x) => x.id === id);
+        const label = entry ? entry.label : "cette ligne";
+        if (!window.confirm("Supprimer « " + label + " » ?")) return;
+        state.compta.entries = state.compta.entries.filter((x) => x.id !== id);
+        saveState();
+        toast("Ligne supprimée");
+        renderCompta();
+      });
+    });
+  }
+
   function renderSynthese() {
     currentView = "synthese";
     currentUnit = null;
@@ -1117,6 +1617,7 @@
         toast("Import réussi");
         if (currentView === "detail" && currentUnit) renderDetail();
         else if (currentView === "synthese") renderSynthese();
+        else if (currentView === "compta") renderCompta();
         else renderHome();
       } catch (e) {
         toast("Fichier JSON invalide");
@@ -1143,7 +1644,7 @@
   function resetAll() {
     closeMenu();
     const ok = window.confirm(
-      "Réinitialiser toutes les données ?\n\nLes 60 logements, interventions, rapports et médias reviendront à zéro. Cette action est irréversible (sauf si vous avez un export JSON)."
+      "Réinitialiser toutes les données ?\n\nLes 60 logements, interventions, rapports, médias et la comptabilité reviendront à zéro. Cette action est irréversible (sauf si vous avez un export JSON)."
     );
     if (!ok) return;
     clearAllMediaBlobs().then(() => {
@@ -1152,6 +1653,12 @@
       searchQuery = "";
       filter = "all";
       currentUnit = null;
+      comptaPeriod = "month";
+      comptaType = "all";
+      comptaUnit = "";
+      comptaCustomFrom = "";
+      comptaCustomTo = "";
+      comptaEditingId = null;
       toast("Données réinitialisées");
       renderHome();
     });
@@ -1185,9 +1692,14 @@
       const view = btn.dataset.view;
       if (view === "home") {
         currentUnit = null;
+        comptaEditingId = null;
         renderHome();
       } else if (view === "synthese") {
+        comptaEditingId = null;
         renderSynthese();
+      } else if (view === "compta") {
+        comptaEditingId = null;
+        renderCompta();
       }
     });
   });
