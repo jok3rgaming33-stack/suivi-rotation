@@ -1448,7 +1448,7 @@ input[type="date"]::-webkit-calendar-picker-indicator {
   position: fixed;
   right: max(1rem, calc((100vw - var(--max)) / 2 + 1rem));
   bottom: calc(1.25rem + env(safe-area-inset-bottom, 0px));
-  z-index: 40;
+  z-index: 80;
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
@@ -1498,4 +1498,20 @@ input[type="date"]::-webkit-calendar-picker-indicator {
   .fab-label {
     /* keep label for clarity on mobile artisan UX */
   }
+}
+
+#fab-host {
+  position: relative;
+  z-index: 80;
+  pointer-events: none;
+}
+#fab-host > * {
+  pointer-events: auto;
+}
+.btn-compta-add-top {
+  width: 100%;
+  margin-bottom: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 800;
 }

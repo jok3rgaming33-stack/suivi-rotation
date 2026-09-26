@@ -571,6 +571,7 @@
   }
 
   function renderHome() {
+    clearFabHost();
     currentView = "home";
     setHeader("Suivi Rotation", "Le coup de main qu'il vous faut", false, { brandSlogan: true });
     const g = globalStats();
@@ -726,6 +727,7 @@
   }
 
   function renderDetail() {
+    clearFabHost();
     const unit = state.units[currentUnit];
     if (!unit) {
       renderHome();
@@ -1106,6 +1108,25 @@
     return { from, to };
   }
 
+  function clearFabHost() {
+    const host = document.getElementById("fab-host");
+    if (host) host.innerHTML = "";
+  }
+
+  function mountComptaFab() {
+    const host = document.getElementById("fab-host");
+    if (!host) return;
+    host.innerHTML = `
+      <button type="button" class="fab-compta" id="compta-add" aria-label="Ajouter une ligne">
+        <span class="fab-plus">+</span>
+        <span class="fab-label">Ajouter</span>
+      </button>`;
+    document.getElementById("compta-add").addEventListener("click", () => {
+      comptaEditingId = "new";
+      renderCompta();
+    });
+  }
+
   function ensureCompta() {
     if (!state.compta || !Array.isArray(state.compta.entries)) {
       state.compta = { entries: [] };
@@ -1319,6 +1340,7 @@
     ensureCompta();
 
     if (comptaEditingId === "new") {
+      clearFabHost();
       $app.innerHTML = renderComptaForm(null);
       bindComptaForm(null);
       return;
@@ -1328,6 +1350,7 @@
       if (!entry) {
         comptaEditingId = null;
       } else {
+        clearFabHost();
         $app.innerHTML = renderComptaForm(entry);
         bindComptaForm(entry.id);
         return;
@@ -1442,15 +1465,13 @@
       </div>
       ${customRow}
 
-      <div class="compta-list">${listHtml}</div>
+      <button type="button" class="btn btn-primary btn-compta-add-top" id="compta-add-top">+ Ajouter une ligne</button>
 
-      <button type="button" class="fab-compta" id="compta-add" aria-label="Ajouter une ligne">
-        <span class="fab-plus">+</span>
-        <span class="fab-label">Ajouter</span>
-      </button>
+      <div class="compta-list">${listHtml}</div>
     `;
 
-    document.getElementById("compta-add").addEventListener("click", () => {
+    mountComptaFab();
+    document.getElementById("compta-add-top").addEventListener("click", () => {
       comptaEditingId = "new";
       renderCompta();
     });
@@ -1514,6 +1535,7 @@
   }
 
   function renderSynthese() {
+    clearFabHost();
     currentView = "synthese";
     currentUnit = null;
     setHeader("Synthèse globale", "Vue d'ensemble des interventions", false);
